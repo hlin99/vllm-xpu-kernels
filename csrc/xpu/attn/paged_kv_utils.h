@@ -3,13 +3,40 @@
 #include <limits>
 #include <torch/all.h>
 
-// Normalize the physical page stride to sequence-position units. For a regular
-// contiguous layout [num_blocks, block_size, num_heads, head_size], this equals
-// block_size. For interleaved or cross-layer layouts, it includes the physical
-// gaps between logical KV blocks.
+// Detect whether a paged KV cache tensor uses HND layout.
+//
+// paged KV supports two layouts:
+//   NHD: [num_blocks, block_size, num_heads, head_size]  (contiguous)
+//   HND: [num_blocks, num_heads, block_size, head_size]  (permuted from NHD)
+//
+// HND is created by permuting an NHD tensor via .permute(0, 2, 1, 3).
+// After permutation the strides encode the layout:
+//   NHD contiguous:  stride(1) = num_heads*head_size  > stride(2) = head_size
+//   HND (permuted):  stride(1) = head_size            < stride(2) =
+//   num_heads*head_size
+//
+// So the check simplifies to: stride(1) < stride(2) means dim1 and dim2
+// were swapped, i.e. HND layout.
+//
+// This check is robust for cross-layer (non-contiguous page stride) tensors
+// because stride(1) and stride(2) within each block are unchanged by the
+// outer non-contiguous stride(0).
+inline bool is_paged_kv_hnd_layout(const at::Tensor& key_cache) {
+  return key_cache.stride(2) > key_cache.stride(1);
+}
+
+// Normalize the physical page stride to sequence-position units.
+// paged KV: NHD [num_blocks, block_size, num_heads, head_size]
+//        or HND [num_blocks, num_heads, block_size, head_size] (permuted).
+// For a regular contiguous NHD layout this equals block_size.
+// For interleaved or cross-layer layouts it includes the physical gaps between
+// logical KV blocks.
 inline int64_t
 get_paged_kv_cache_page_stride_elements(const at::Tensor& key_cache) {
-  return key_cache.stride(0) / key_cache.stride(1);
+  // seq stride: NHD→stride(1), HND (permuted)→stride(2)
+  int64_t seq_stride = is_paged_kv_hnd_layout(key_cache) ? key_cache.stride(2)
+                                                         : key_cache.stride(1);
+  return key_cache.stride(0) / seq_stride;
 }
 
 // Return the sequence length needed by the 2D load surface to cover the full
@@ -23,11 +50,27 @@ get_paged_kv_cache_effective_total_seqlen(const at::Tensor& key_cache) {
 
 // Validate that the physical page stride can be converted to sequence-position
 // units and safely passed through int32 kernel parameters.
+// Supports both NHD [num_blocks, block_size, num_heads, head_size] and
+// HND [num_blocks, num_heads, block_size, head_size] (permuted) layouts.
 inline void check_paged_kv_cache_strides(
     const at::Tensor& key_cache, const at::Tensor& value_cache) {
-  int64_t k_stride_seq = key_cache.stride(1);
+  // Ensure K and V use the same layout — downstream kernels derive layout
+  // from key_cache only and apply it to both tensors.
+  bool k_is_hnd = is_paged_kv_hnd_layout(key_cache);
+  bool v_is_hnd = is_paged_kv_hnd_layout(value_cache);
+  TORCH_CHECK(
+      k_is_hnd == v_is_hnd,
+      "Paged K and V caches must use the same layout (both NHD or both HND), "
+      "but got K=",
+      k_is_hnd ? "HND" : "NHD",
+      " V=",
+      v_is_hnd ? "HND" : "NHD");
+
+  // seq stride: NHD→stride(1), HND (permuted)→stride(2)
+  int64_t k_stride_seq = k_is_hnd ? key_cache.stride(2) : key_cache.stride(1);
   int64_t k_physical_page_stride = key_cache.stride(0);
-  int64_t v_stride_seq = value_cache.stride(1);
+  int64_t v_stride_seq =
+      v_is_hnd ? value_cache.stride(2) : value_cache.stride(1);
   int64_t v_physical_page_stride = value_cache.stride(0);
   TORCH_CHECK(
       k_stride_seq > 0,
