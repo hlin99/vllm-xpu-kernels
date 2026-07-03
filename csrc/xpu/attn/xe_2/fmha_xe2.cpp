@@ -92,6 +92,7 @@ void cutlass_chunk_prefill_impl(
   // additional params
   int total_seqlen_q, total_seqlen_k;
   int num_blocks, block_size, max_blocks_per_seq;
+  bool is_hnd = false;
   if (is_varlen) {
     // query: [total_seq, num_heads, head_size]
     batch_size = cu_seqlens_q.numel() - 1;
@@ -116,7 +117,7 @@ void cutlass_chunk_prefill_impl(
     // Layout detection: HND is created by permuting NHD via permute(0,2,1,3).
     // NHD [N,B,H,D]: stride(1)=H*D = size(2)*stride(2)
     // HND [N,H,B,D]: stride(1)=D   != size(2)*stride(2)=B*(H*D)
-    bool is_hnd = is_paged_kv_hnd_layout(key_cache);
+    is_hnd = is_paged_kv_hnd_layout(key_cache);
     if (is_hnd) {
       num_heads_kv = key_cache.size(1);  // HND: dim1=num_heads
       block_size = key_cache.size(2);    // HND: dim2=block_size
@@ -193,7 +194,6 @@ void cutlass_chunk_prefill_impl(
       // paged KV: NHD [num_blocks, block_size, num_heads_kv, head_size]
       //        or HND [num_blocks, num_heads_kv, block_size, head_size]
       //        (permuted)
-      bool is_hnd = is_paged_kv_hnd_layout(key_cache);
       if (is_hnd) {
         args.k_stride_seq = key_cache.stride(2);    // seq dim = dim2
         args.k_stride_heads = key_cache.stride(1);  // head dim = dim1
@@ -230,7 +230,6 @@ void cutlass_chunk_prefill_impl(
       // paged KV: NHD [num_blocks, block_size, num_heads_kv, head_size]
       //        or HND [num_blocks, num_heads_kv, block_size, head_size]
       //        (permuted)
-      bool is_hnd = is_paged_kv_hnd_layout(key_cache);
       if (is_hnd) {
         args.k_stride_seq = key_cache.stride(2);    // seq dim = dim2
         args.k_stride_heads = key_cache.stride(1);  // head dim = dim1

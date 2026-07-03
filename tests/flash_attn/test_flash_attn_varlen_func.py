@@ -1163,6 +1163,8 @@ def test_varlen_with_cross_layer_paged_kv(
         # [num_blocks, num_kv_heads, block_size, head_size]
         key_cache = key_cache_nhd.permute(0, 2, 1, 3)
         value_cache = value_cache_nhd.permute(0, 2, 1, 3)
+        assert key_cache.stride(0) == key_cache_nhd.stride(0)
+        assert value_cache.stride(0) == value_cache_nhd.stride(0)
     else:
         key_cache = key_cache_nhd
         value_cache = value_cache_nhd
@@ -1296,6 +1298,8 @@ def test_decode_with_cross_layer_paged_kv(
         # [num_blocks, num_kv_heads, block_size, head_size]
         key_cache = key_cache_nhd.permute(0, 2, 1, 3)
         value_cache = value_cache_nhd.permute(0, 2, 1, 3)
+        assert key_cache.stride(0) == key_cache_nhd.stride(0)
+        assert value_cache.stride(0) == value_cache_nhd.stride(0)
     else:
         key_cache = key_cache_nhd
         value_cache = value_cache_nhd

@@ -138,6 +138,7 @@ void cutlass_paged_decode_impl(
   // additional params
   int total_seqlen_q, total_seqlen_k;
   int num_blocks, block_size, max_blocks_per_seq;
+  bool is_hnd = false;
   if (is_varlen) {
     // query: [total_seq, num_heads, head_size]
     batch_size = cu_seqlens_q.numel() - 1;
@@ -165,7 +166,7 @@ void cutlass_paged_decode_impl(
     // Layout detection: HND is created by permuting NHD via permute(0,2,1,3).
     // NHD [N,B,H,D]: stride(1)=H*D = size(2)*stride(2)
     // HND [N,H,B,D]: stride(1)=D   != size(2)*stride(2)=B*(H*D)
-    bool is_hnd = is_paged_kv_hnd_layout(key_cache);
+    is_hnd = is_paged_kv_hnd_layout(key_cache);
     if (is_hnd) {
       num_heads_kv = key_cache.size(1);  // HND: dim1=num_heads
       block_size = key_cache.size(2);    // HND: dim2=block_size
@@ -192,7 +193,6 @@ void cutlass_paged_decode_impl(
   // Compute layout-aware KV strides before initializing args.
   // paged KV: NHD [N, block_size, num_heads, head_size] (seq=dim1, head=dim2)
   //        or HND [N, num_heads, block_size, head_size] (seq=dim2, head=dim1)
-  bool is_hnd = is_paged && is_paged_kv_hnd_layout(key_cache);
   int64_t k_stride_seq =
       is_paged ? (is_hnd ? key_cache.stride(2) : key_cache.stride(1))
                : key_cache.stride(1);
