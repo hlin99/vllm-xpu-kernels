@@ -490,13 +490,15 @@ def test_varlen_with_interleaved_paged_kv(
         combined_kv_hnd = combined_kv_nhd.permute(0, 2, 1, 3)
         key_cache = combined_kv_hnd[:, :, :block_size, :]
         value_cache = combined_kv_hnd[:, :, block_size:, :]
+        # stride(0) is unchanged by permuting dims 1 and 2: both layouts share
+        # the same total elements per row from the combined allocation.
         assert key_cache.stride(0) == 2 * block_size * num_kv_heads * head_size
     else:
         key_cache = combined_kv_nhd[:, :block_size, :, :]
         value_cache = combined_kv_nhd[:, block_size:, :, :]
         assert key_cache.stride(0) == 2 * block_size * num_kv_heads * head_size
 
-    assert key_cache.shape[-2:] == value_cache.shape[-2:]
+    assert key_cache.shape == value_cache.shape
 
     cu_query_lens = torch.tensor([0] + query_lens,
                                  dtype=torch.int32).cumsum(dim=0,

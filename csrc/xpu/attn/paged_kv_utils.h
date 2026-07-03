@@ -18,8 +18,7 @@
 // because stride(1) and stride(2) within each block are unchanged by the
 // outer non-contiguous stride(0).
 inline bool is_paged_kv_hnd_layout(const at::Tensor& key_cache) {
-  return key_cache.stride(1) !=
-         (int64_t)key_cache.size(2) * key_cache.stride(2);
+  return key_cache.stride(1) != key_cache.size(2) * key_cache.stride(2);
 }
 
 // Normalize the physical page stride to sequence-position units.
