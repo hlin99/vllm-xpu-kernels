@@ -484,15 +484,14 @@ if __name__ == "__main__":
 
     # ================================================================
     # Batch Decode Benchmark (per-seq adaptive split-K evaluation)
-    # NHD vs HND KV layout comparison
     # ================================================================
-    print("\n" + "=" * 90)
-    print("Batch Decode Benchmark (per-seq adaptive split-K) — NHD vs HND layout")
-    print("=" * 90)
+    print("\n" + "=" * 80)
+    print("Batch Decode Benchmark (per-seq adaptive split-K)")
+    print("=" * 80)
     hdr = (f"{'config':<40} | {'batch':>5} {'kv_sum':>7} | "
-           f"{'NHD(us)':>9} {'HND(us)':>9} {'ratio':>7} {'winner':>6}")
+           f"{'time(us)':>9} {'BW(GB/s)':>9}")
     print(hdr)
-    print("-" * 90)
+    print("-" * 80)
 
     for cfg in BATCH_DECODE_CONFIGS:
         name = cfg[-1]
@@ -500,31 +499,67 @@ if __name__ == "__main__":
         num_seqs = int(seq_lens.split(",")[0])
         kv_lens = list(map(int, seq_lens.split(",")[2].split("+")))
         kv_sum = sum(kv_lens)
-        nhd_us = float("nan")
-        hnd_us = float("nan")
         try:
-            nhd_us, _ = benchmark_batch_decode(cfg, iterations=200,
-                                               kv_layout="NHD")
+            avg_us, bw_gbs = benchmark_batch_decode(cfg, iterations=200)
+            print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
+                  f"{avg_us:>9.1f} {bw_gbs:>9.1f}")
         except Exception as e:
             print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
-                  f"{'NHD ERROR':>9} {str(e)[:20]}")
+                  f"{'ERROR':>9} {str(e)[:20]}")
         clear_xpu_cache()
+
+    print("=" * 80)
+
+    # ================================================================
+    # NHD vs HND KV Layout Comparison
+    # ================================================================
+    print("\n" + "=" * 115)
+    print("Batch Decode: NHD vs HND KV Layout Comparison")
+    print("=" * 115)
+    hdr = (f"{'config':<40} | {'batch':>5} {'kv_sum':>7} | "
+           f"{'NHD(us)':>9} {'NHD_BW':>8} | "
+           f"{'HND(us)':>9} {'HND_BW':>8} | "
+           f"{'ratio':>6} {'winner':>6}")
+    print(hdr)
+    print("-" * 115)
+
+    for cfg in BATCH_DECODE_CONFIGS:
+        name = cfg[-1]
+        seq_lens = cfg[0]
+        num_seqs = int(seq_lens.split(",")[0])
+        kv_lens = list(map(int, seq_lens.split(",")[2].split("+")))
+        kv_sum = sum(kv_lens)
+
+        nhd_us = nhd_bw = hnd_us = hnd_bw = float("nan")
         try:
-            hnd_us, _ = benchmark_batch_decode(cfg, iterations=200,
-                                               kv_layout="HND")
+            nhd_us, nhd_bw = benchmark_batch_decode(cfg, iterations=200,
+                                                     kv_layout="NHD")
         except Exception as e:
             print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
-                  f"{'HND ERROR':>9} {str(e)[:20]}")
+                  f"NHD ERROR: {str(e)[:30]}")
+        clear_xpu_cache()
+
+        try:
+            hnd_us, hnd_bw = benchmark_batch_decode(cfg, iterations=200,
+                                                     kv_layout="HND")
+        except Exception as e:
+            print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
+                  f"HND ERROR: {str(e)[:30]}")
         clear_xpu_cache()
 
         if (not math.isnan(nhd_us) and not math.isnan(hnd_us)
                 and nhd_us > 0 and hnd_us > 0):
             ratio = nhd_us / hnd_us
-            winner = "HND" if ratio > 1.0 else "NHD"
+            winner = "HND" if ratio > 1.01 else (
+                "NHD" if ratio < 0.99 else "~same")
             print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
-                  f"{nhd_us:>9.1f} {hnd_us:>9.1f} {ratio:>7.3f} {winner:>6}")
+                  f"{nhd_us:>9.1f} {nhd_bw:>8.1f} | "
+                  f"{hnd_us:>9.1f} {hnd_bw:>8.1f} | "
+                  f"{ratio:>6.3f} {winner:>6}")
         else:
             print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
-                  f"{nhd_us:>9} {hnd_us:>9} {'N/A':>7} {'N/A':>6}")
+                  f"{'N/A':>9} {'N/A':>8} | "
+                  f"{'N/A':>9} {'N/A':>8} | "
+                  f"{'N/A':>6} {'N/A':>6}")
 
-    print("=" * 90)
+    print("=" * 115)
