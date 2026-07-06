@@ -249,12 +249,6 @@ def benchmark_varlen_with_paged_kv(num_seqs,
                 kv_layout=kv_layout)
     num_query_heads = num_heads[0]
 
-    print(f"Running config: {num_seqs, query_lens, kv_lens, \
-                              num_heads, head_size, block_size, \
-                              window_size, output_dtype, soft_cap, num_blocks, \
-                              fa_versions, q_dtype, is_sink, is_causal, \
-                              is_paged, kv_dtype}, Provider: {provider}",
-          flush=True)
     assert iterations > 5, \
     "Number of iterations should be greater than 5 to account for warmup"
 
