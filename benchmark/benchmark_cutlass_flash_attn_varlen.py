@@ -43,7 +43,7 @@ def calculate_flops(num_query_heads, query_lens, kv_lens, head_size,
     return total
 
 
-def make_varlen_with_paged_kv_input(config):
+def make_varlen_with_paged_kv_input(config, kv_layout="NHD"):
     num_seqs, query_lens, kv_lens, num_heads, head_size, \
         block_size, window_size, output_dtype, _, num_blocks, \
         _, q_dtype, is_sink, is_causal, is_paged, kv_dtype = config
@@ -63,17 +63,32 @@ def make_varlen_with_paged_kv_input(config):
                         head_size,
                         dtype=output_dtype)
     if is_paged:
-        key_cache = torch.randn(num_blocks,
-                                block_size,
-                                num_kv_heads,
-                                head_size,
-                                dtype=output_dtype)
+        # Create KV cache in NHD layout first, then permute to HND if requested.
+        # HND: [num_blocks, num_kv_heads, block_size, head_size]
+        #   (non-contiguous strides auto-detected by the kernel).
+        # NHD: [num_blocks, block_size, num_kv_heads, head_size] (contiguous).
+        key_cache_nhd = torch.randn(num_blocks,
+                                    block_size,
+                                    num_kv_heads,
+                                    head_size,
+                                    dtype=output_dtype)
+        value_cache_nhd = torch.randn(num_blocks,
+                                      block_size,
+                                      num_kv_heads,
+                                      head_size,
+                                      dtype=output_dtype)
+        if kv_layout == "HND":
+            key_cache = key_cache_nhd.permute(0, 2, 1, 3)
+            value_cache = value_cache_nhd.permute(0, 2, 1, 3)
+        else:
+            key_cache = key_cache_nhd
+            value_cache = value_cache_nhd
     else:
         key_cache = torch.randn(sum(kv_lens),
                                 num_query_heads,
                                 head_size,
                                 dtype=output_dtype)
-    value_cache = torch.randn_like(key_cache)
+        value_cache = torch.randn_like(key_cache)
 
     cu_query_lens = torch.tensor([0] + query_lens,
                                  dtype=torch.int32).cumsum(dim=0,
@@ -217,7 +232,8 @@ def benchmark_varlen_with_paged_kv(num_seqs,
                                    is_paged,
                                    kv_dtype,
                                    provider,
-                                   iterations=20):
+                                   iterations=20,
+                                   kv_layout="NHD"):
     maybe_quantized_query, maybe_quantized_key_cache, \
         maybe_quantized_value_cache, \
         max_query_len, cu_query_lens, max_kv_len, cu_kv_lens, \
@@ -228,7 +244,8 @@ def benchmark_varlen_with_paged_kv(num_seqs,
                 query_lens, kv_lens, num_heads, head_size,
                 block_size, window_size, output_dtype, soft_cap,
                 num_blocks, fa_versions, q_dtype, is_sink,
-                is_causal, is_paged, kv_dtype))
+                is_causal, is_paged, kv_dtype),
+                kv_layout=kv_layout)
     num_query_heads = num_heads[0]
 
     print(f"Running config: {num_seqs, query_lens, kv_lens, \
