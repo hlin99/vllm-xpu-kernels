@@ -517,7 +517,8 @@ if __name__ == "__main__":
                   f"{'HND ERROR':>9} {str(e)[:20]}")
         clear_xpu_cache()
 
-        if not math.isnan(nhd_us) and not math.isnan(hnd_us) and hnd_us > 0:
+        if (not math.isnan(nhd_us) and not math.isnan(hnd_us)
+                and nhd_us > 0 and hnd_us > 0):
             ratio = nhd_us / hnd_us
             winner = "HND" if ratio > 1.0 else "NHD"
             print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
