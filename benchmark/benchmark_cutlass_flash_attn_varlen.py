@@ -513,31 +513,6 @@ def filter_configs(configs):
     return new_configs
 
 
-# Prefill configs for NHD vs HND comparison (paged only, bf16, no FP8)
-# Format: (num_seqs, query_lens, kv_lens, num_heads, head_size,
-#           block_size, window_size, output_dtype, soft_cap,
-#           num_blocks, fa_versions, q_dtype, is_sink, is_causal,
-#           is_paged, kv_dtype, name)
-PREFILL_LAYOUT_CONFIGS = [
-    (3, "1,5,129", "1328,18,463", (8, 2), 128, 64, (-1, -1),
-     torch.bfloat16, None, 2048, 2, None, False, True, True, None,
-     "varlen_paged_(8,2)_h128"),
-    (3, "1,5,129", "1328,18,463", (32, 8), 128, 64, (-1, -1),
-     torch.bfloat16, None, 2048, 2, None, False, True, True, None,
-     "varlen_paged_(32,8)_h128"),
-    (3, "1,5,129", "1328,18,463", (16, 2), 128, 64, (-1, -1),
-     torch.bfloat16, None, 2048, 2, None, False, True, True, None,
-     "varlen_paged_(16,2)_h128"),
-    (8, "128,128,128,128,128,128,128,128",
-     "1024,1024,2048,2048,4096,4096,8192,8192", (32, 8), 128, 64, (-1, -1),
-     torch.bfloat16, None, 2048, 2, None, False, True, True, None,
-     "chunked_prefill_(32,8)_h128"),
-    (4, "256,256,256,256", "4096,4096,8192,8192", (32, 2), 128, 64, (-1, -1),
-     torch.bfloat16, None, 2048, 2, None, False, True, True, None,
-     "chunked_prefill_(32,2)_h128"),
-]
-
-
 if __name__ == "__main__":
 
     args = parse_args()
@@ -566,58 +541,56 @@ if __name__ == "__main__":
 
     # ================================================================
     # Prefill (varlen paged): NHD vs HND KV Layout Comparison
+    # Uses the same perf configs, only runs paged ones with both layouts.
     # ================================================================
-    print("\n" + "=" * 100)
-    print("Prefill (varlen paged): NHD vs HND KV Layout Comparison")
-    print("=" * 100)
-    hdr = (f"{'config':<35} | {'heads':>8} {'h_sz':>4} | "
-           f"{'NHD(us)':>9} {'HND(us)':>9} {'ratio':>6} {'winner':>6}")
-    print(hdr)
-    print("-" * 100)
+    paged_configs = [c for c in configs if c[14] is True]  # is_paged=True
+    if paged_configs:
+        print("\n" + "=" * 100)
+        print("Prefill (varlen paged): NHD vs HND KV Layout Comparison")
+        print("=" * 100)
+        hdr = (f"{'num_seqs':>8} {'q_lens':>12} {'kv_lens':>12} "
+               f"{'heads':>8} {'h_sz':>4} {'blk':>4} | "
+               f"{'NHD(us)':>9} {'HND(us)':>9} {'ratio':>6} {'winner':>6}")
+        print(hdr)
+        print("-" * 100)
 
-    for cfg_tuple in PREFILL_LAYOUT_CONFIGS:
-        *cfg_fields, name = cfg_tuple
-        config = tuple(cfg_fields)
-        num_heads = config[3]
+        for cfg in paged_configs:
+            (num_seqs, query_lens, kv_lens, num_heads, head_size,
+             block_size, window_size, output_dtype, soft_cap,
+             num_blocks, fa_versions, q_dtype, is_sink, is_causal,
+             is_paged, kv_dtype) = cfg
 
-        nhd_us = hnd_us = float("nan")
-        try:
-            nhd_us = benchmark_varlen_with_paged_kv(
-                *config[:3], num_heads=config[3], head_size=config[4],
-                block_size=config[5], window_size=config[6],
-                output_dtype=config[7], soft_cap=config[8],
-                num_blocks=config[9], fa_versions=config[10],
-                q_dtype=config[11], is_sink=config[12],
-                is_causal=config[13], is_paged=config[14],
-                kv_dtype=config[15], provider="flash_kernel_time",
-                iterations=iterations, kv_layout="NHD")
-        except Exception as e:
-            print(f"{name:<35} | NHD ERROR: {str(e)[:40]}")
-        clear_xpu_cache()
+            nhd_us = hnd_us = float("nan")
+            try:
+                nhd_us = benchmark_varlen_with_paged_kv(
+                    num_seqs, query_lens, kv_lens, num_heads, head_size,
+                    block_size, window_size, output_dtype, soft_cap,
+                    num_blocks, fa_versions, q_dtype, is_sink, is_causal,
+                    is_paged, kv_dtype, provider="flash_kernel_time",
+                    iterations=iterations, kv_layout="NHD")
+            except Exception as e:
+                print(f"  NHD ERROR: {cfg[:6]} — {str(e)[:40]}")
+            clear_xpu_cache()
 
-        try:
-            hnd_us = benchmark_varlen_with_paged_kv(
-                *config[:3], num_heads=config[3], head_size=config[4],
-                block_size=config[5], window_size=config[6],
-                output_dtype=config[7], soft_cap=config[8],
-                num_blocks=config[9], fa_versions=config[10],
-                q_dtype=config[11], is_sink=config[12],
-                is_causal=config[13], is_paged=config[14],
-                kv_dtype=config[15], provider="flash_kernel_time",
-                iterations=iterations, kv_layout="HND")
-        except Exception as e:
-            print(f"{name:<35} | HND ERROR: {str(e)[:40]}")
-        clear_xpu_cache()
+            try:
+                hnd_us = benchmark_varlen_with_paged_kv(
+                    num_seqs, query_lens, kv_lens, num_heads, head_size,
+                    block_size, window_size, output_dtype, soft_cap,
+                    num_blocks, fa_versions, q_dtype, is_sink, is_causal,
+                    is_paged, kv_dtype, provider="flash_kernel_time",
+                    iterations=iterations, kv_layout="HND")
+            except Exception as e:
+                print(f"  HND ERROR: {cfg[:6]} — {str(e)[:40]}")
+            clear_xpu_cache()
 
-        if (not math.isnan(nhd_us) and not math.isnan(hnd_us)
-                and nhd_us > 0 and hnd_us > 0):
-            ratio = nhd_us / hnd_us
-            winner = "HND" if ratio > 1.01 else (
-                "NHD" if ratio < 0.99 else "~same")
-            print(f"{name:<35} | {str(num_heads):>8} {config[4]:>4} | "
-                  f"{nhd_us:>9.1f} {hnd_us:>9.1f} {ratio:>6.3f} {winner:>6}")
-        else:
-            print(f"{name:<35} | {str(num_heads):>8} {config[4]:>4} | "
-                  f"{'N/A':>9} {'N/A':>9} {'N/A':>6} {'N/A':>6}")
+            if (not math.isnan(nhd_us) and not math.isnan(hnd_us)
+                    and nhd_us > 0 and hnd_us > 0):
+                ratio = nhd_us / hnd_us
+                winner = "HND" if ratio > 1.01 else (
+                    "NHD" if ratio < 0.99 else "~same")
+                print(f"{num_seqs:>8} {query_lens:>12} {kv_lens:>12} "
+                      f"{str(num_heads):>8} {head_size:>4} {block_size:>4} | "
+                      f"{nhd_us:>9.1f} {hnd_us:>9.1f} "
+                      f"{ratio:>6.3f} {winner:>6}")
 
-    print("=" * 100)
+        print("=" * 100)
