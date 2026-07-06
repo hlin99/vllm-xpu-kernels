@@ -540,25 +540,35 @@ if __name__ == "__main__":
     benchmark.run(print_data=True, save_path=save_path)
 
     # ================================================================
-    # Prefill (varlen paged): NHD vs HND KV Layout Comparison
-    # Uses the same perf configs, only runs paged ones with both layouts.
+    # Varlen Paged: NHD vs HND KV Layout Comparison
     # ================================================================
     paged_configs = [c for c in configs if c[14] is True]  # is_paged=True
     if paged_configs:
-        print("\n" + "=" * 100)
-        print("Prefill (varlen paged): NHD vs HND KV Layout Comparison")
-        print("=" * 100)
-        hdr = (f"{'num_seqs':>8} {'q_lens':>12} {'kv_lens':>12} "
-               f"{'heads':>8} {'h_sz':>4} {'blk':>4} | "
-               f"{'NHD(us)':>9} {'HND(us)':>9} {'ratio':>6} {'winner':>6}")
+        print("\n" + "=" * 115)
+        print("Varlen Paged: NHD vs HND KV Layout Comparison")
+        print("=" * 115)
+        hdr = (f"{'config':<50} | {'seqs':>4} {'kv_sum':>7} | "
+               f"{'NHD(us)':>9} {'HND(us)':>9} | "
+               f"{'ratio':>6} {'winner':>6}")
         print(hdr)
-        print("-" * 100)
+        print("-" * 115)
 
         for cfg in paged_configs:
             (num_seqs, query_lens, kv_lens, num_heads, head_size,
              block_size, window_size, output_dtype, soft_cap,
              num_blocks, fa_versions, q_dtype, is_sink, is_causal,
              is_paged, kv_dtype) = cfg
+
+            # Build a readable config name (similar to decode benchmark)
+            dtype_str = "bf16" if output_dtype == torch.bfloat16 else "fp16"
+            causal_str = "causal" if is_causal else "nocausal"
+            sink_str = "_sink" if is_sink else ""
+            name = (f"B{num_seqs}_{num_heads}_h{head_size}"
+                    f"_blk{block_size}_{dtype_str}_{causal_str}{sink_str}")
+
+            # Compute kv_sum from the kv_lens string
+            kv_lens_list = list(map(int, kv_lens.split(",")))
+            kv_sum = sum(kv_lens_list)
 
             nhd_us = hnd_us = float("nan")
             try:
@@ -569,7 +579,8 @@ if __name__ == "__main__":
                     is_paged, kv_dtype, provider="flash_kernel_time",
                     iterations=iterations, kv_layout="NHD")
             except Exception as e:
-                print(f"  NHD ERROR: {cfg[:6]} — {str(e)[:40]}")
+                print(f"{name:<50} | {num_seqs:>4} {kv_sum:>7} | "
+                      f"NHD ERROR: {str(e)[:30]}")
             clear_xpu_cache()
 
             try:
@@ -580,7 +591,8 @@ if __name__ == "__main__":
                     is_paged, kv_dtype, provider="flash_kernel_time",
                     iterations=iterations, kv_layout="HND")
             except Exception as e:
-                print(f"  HND ERROR: {cfg[:6]} — {str(e)[:40]}")
+                print(f"{name:<50} | {num_seqs:>4} {kv_sum:>7} | "
+                      f"HND ERROR: {str(e)[:30]}")
             clear_xpu_cache()
 
             if (not math.isnan(nhd_us) and not math.isnan(hnd_us)
@@ -588,9 +600,12 @@ if __name__ == "__main__":
                 ratio = nhd_us / hnd_us
                 winner = "HND" if ratio > 1.01 else (
                     "NHD" if ratio < 0.99 else "~same")
-                print(f"{num_seqs:>8} {query_lens:>12} {kv_lens:>12} "
-                      f"{str(num_heads):>8} {head_size:>4} {block_size:>4} | "
-                      f"{nhd_us:>9.1f} {hnd_us:>9.1f} "
+                print(f"{name:<50} | {num_seqs:>4} {kv_sum:>7} | "
+                      f"{nhd_us:>9.1f} {hnd_us:>9.1f} | "
                       f"{ratio:>6.3f} {winner:>6}")
+            else:
+                print(f"{name:<50} | {num_seqs:>4} {kv_sum:>7} | "
+                      f"{'N/A':>9} {'N/A':>9} | "
+                      f"{'N/A':>6} {'N/A':>6}")
 
-        print("=" * 100)
+        print("=" * 115)
