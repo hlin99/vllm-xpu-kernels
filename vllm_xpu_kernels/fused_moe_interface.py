@@ -453,12 +453,31 @@ def xpu_fused_moe(hidden_states,
         output.copy_(out)
         return output
 
+    inter_size = list(w13.shape)[-2] // 2
+
     # 4bits support [E, N, K]
     # other types [E, K, N]
     if not is_int4 and not is_mxfp4:
-        inter_size = list(w13.shape)[-1] // 2
-    else:
-        inter_size = list(w13.shape)[-2] // 2
+        if not hasattr(w13, 'xpu_fused_moe'):
+            # Avoid 2x weight-memory peak: route the transpose+contiguous
+            # via host CPU so the original device buffer is freed before
+            # the new contiguous one is allocated.
+            import gc
+            for _w in (w13, w2):
+                _d = _w.device
+                _cpu = _w.detach().to('cpu')
+                _w.data = torch.empty(0, dtype=_w.dtype, device=_d)
+                gc.collect()
+                if _d.type == 'xpu':
+                    torch.xpu.empty_cache()
+                _new = _cpu.transpose(-1, -2).contiguous().to(_d)
+                del _cpu
+                _w.data = _new
+                del _new
+            w13.xpu_fused_moe = True
+            w13.inter_size = inter_size
+        else:
+            inter_size = w13.inter_size
 
     assert w13.is_contiguous() and w2.is_contiguous()
 
