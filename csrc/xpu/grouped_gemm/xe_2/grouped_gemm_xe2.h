@@ -11,4 +11,6 @@ torch::Tensor cutlass_grouped_gemm_xe2(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4);
+    bool is_B_mxfp4,
+    bool is_batched_layout = false,
+    int64_t max_tokens_for_batched = 0);

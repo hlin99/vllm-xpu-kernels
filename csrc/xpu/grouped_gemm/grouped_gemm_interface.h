@@ -12,3 +12,17 @@ torch::Tensor cutlass_grouped_gemm_interface(
     int64_t num_experts,
     bool is_B_int4,
     bool is_B_mxfp4);
+
+torch::Tensor cutlass_batched_gemm_interface(
+    torch::Tensor ptr_A,
+    torch::Tensor ptr_B,
+    const c10::optional<at::Tensor>& ptr_scales,
+    const c10::optional<at::Tensor>& ptr_bias,
+    torch::Tensor ptr_D,
+    torch::Tensor expert_num_tokens,
+    int64_t max_tokens_per_rank,
+    int64_t N,
+    int64_t K,
+    int64_t num_experts,
+    bool is_B_int4,
+    bool is_B_mxfp4);

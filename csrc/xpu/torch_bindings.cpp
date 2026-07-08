@@ -54,6 +54,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
 #endif
 
   xpu_ops.def(
+      "cutlass_batched_gemm_interface(Tensor ptr_A, Tensor ptr_B, Tensor? "
+      "ptr_scales, "
+      "Tensor? ptr_bias, "
+      "Tensor "
+      "ptr_D, Tensor "
+      "expert_num_tokens, int max_tokens_per_rank, int N, int K, int "
+      "num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
+      "Tensor");
+  xpu_ops.impl(
+      "cutlass_batched_gemm_interface",
+      torch::kXPU,
+      &cutlass_batched_gemm_interface);
+
+  xpu_ops.def(
       "deepseek_scaling_rope(Tensor! positions, Tensor! query, Tensor! key, "
       "Tensor? offsets_opt, Tensor! cos_sin_cache, int rotary_dim, bool "
       "is_neox_style) "
