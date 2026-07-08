@@ -222,6 +222,97 @@ def test_xe_grouped_gemm_fp8(m, n, k, e, topk, dtype, fp8_dtype, has_bias):
     torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("m,n,k", [
+    (1, 256, 128),
+    (4, 512, 256),
+    (16, 1024, 512),
+    (128, 2048, 1024),
+])
+@pytest.mark.parametrize("e", [4])
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
+                         ids=format_tc)
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e5m2, torch.float8_e4m3fn],
+                         ids=format_tc)
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_xe_grouped_gemm_block_fp8(m, n, k, e, topk, dtype, fp8_dtype,
+                                   has_bias):
+    """Test block FP8 GEMM with per-block [128x128] scales.
+
+    Scale shape: [num_experts, N/128, K/128] (3D triggers block FP8 path).
+    """
+    from tests.ops.fp8_quant_op import fp8_block_quant_2d, fp8_block_dequant_2d
+
+    seed_everything(7)
+    block_size = 128
+    num_experts = e
+    total_m = m * topk
+    # input
+    input_A = torch.randn((total_m, k), dtype=dtype,
+                          device=DEVICE).contiguous()
+    ref_A = input_A
+    # weight: [num_experts, K, N] — kernel expects this layout
+    input_B = torch.randn((num_experts, k, n), dtype=dtype, device=DEVICE)
+    if has_bias:
+        bias = torch.randn((num_experts, n), dtype=dtype, device=DEVICE) * 100
+    else:
+        bias = None
+
+    # quantize weight per-block [128, 128]
+    # fp8_block_quant_2d takes [K, N] and returns (q[K,N], scales[K/128, N/128])
+    # kernel expects scales as [num_experts, N/128, K/128]
+    input_B_fp8 = torch.empty_like(input_B, dtype=fp8_dtype)
+    scale_B = torch.empty((num_experts, n // block_size, k // block_size),
+                          dtype=torch.float32,
+                          device=DEVICE)
+    # Keep dequantized in float32 to match kernel's computation path
+    # (kernel accumulates in float32, applies scale in float32, then casts to dtype)
+    input_B_dequantize = torch.empty((num_experts, k, n),
+                                     dtype=torch.float32,
+                                     device=DEVICE)
+    for i in range(num_experts):
+        q, s = fp8_block_quant_2d(input_B[i].float(),
+                                  block_m=block_size,
+                                  block_n=block_size,
+                                  fp8_dtype=fp8_dtype)
+        input_B_fp8[i] = q
+        # s is [K/128, N/128], kernel wants [N/128, K/128]
+        scale_B[i] = s.T
+        input_B_dequantize[i] = fp8_block_dequant_2d(q, s, block_size,
+                                                     block_size,
+                                                     torch.float32)
+
+    # output offset
+    num_rows_per_expert = torch.zeros(num_experts,
+                                      device=DEVICE,
+                                      dtype=torch.int32)
+    init_rows_for_experts(m, topk, num_rows_per_expert)
+    output = torch.empty((total_m, n), dtype=dtype, device=DEVICE)
+
+    # 3D scale triggers block FP8 path in kernel
+    cutlass_grouped_gemm_xe2(input_A, input_B_fp8, scale_B, bias, output,
+                             num_rows_per_expert, n, k, num_experts, False,
+                             False)
+    # ref gg
+    ref = []
+    pre_token_sum = 0
+    for i in range(num_experts):
+        cur_token_num = num_rows_per_expert[i]
+        if cur_token_num == 0:
+            continue
+        input = ref_A[pre_token_sum:pre_token_sum + cur_token_num, :].to(
+            torch.float32)
+        weight = input_B_dequantize[i, :, :]  # already float32
+        expert_output_fp32 = input @ weight
+        if has_bias:
+            expert_output_fp32 += bias[i]
+        ref.append(expert_output_fp32.to(dtype))
+        pre_token_sum += cur_token_num
+    ref = torch.cat(ref, dim=0)
+
+    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+
+
 def dequantize_uint4(qweight, scales, group_size):
     import numpy as np
     k = qweight.shape[1] * 2

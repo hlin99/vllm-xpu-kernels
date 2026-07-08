@@ -13,7 +13,9 @@ torch::Tensor cutlass_grouped_gemm_xe2(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4) {
+    bool is_B_mxfp4,
+    bool is_batched_layout,
+    int64_t max_tokens_for_batched) {
   return MoE::cutlass_grouped_gemm_xe2_impl(
       ptr_A,
       ptr_B,
@@ -25,5 +27,7 @@ torch::Tensor cutlass_grouped_gemm_xe2(
       K,
       num_experts,
       is_B_int4,
-      is_B_mxfp4);
+      is_B_mxfp4,
+      is_batched_layout,
+      max_tokens_for_batched);
 }

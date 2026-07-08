@@ -233,6 +233,200 @@ CUTE_DEVICE void xe_gemm(
   copy(copy_c, tCrC_out, tCgC);
 }
 
+// Block FP8 GEMM: weight scales are per 128x128 block [N/128, K/128]
+template <
+    class GmemTiledCopyA,
+    class GmemTiledCopyB,
+    class GmemTiledCopyC,
+    class ATensor,
+    class BTensor,
+    class DTensor,
+    class TiledMMA,
+    typename ElementS,
+    typename ElementBI>
+CUTE_DEVICE void xe_gemm_block_fp8(
+    ATensor const& A,  // (M,K)
+    BTensor const& B,  // (N,K)
+    const ElementS* Scales,  // [N/128, K/128] for this expert
+    const ElementBI* Bias,
+    DTensor& C,  // (M,N)
+    Coord<int, int, cute::Underscore, int> blk_coord,
+    TiledMMA const& mma,
+    const int32_t num_k_blocks) {
+  using TA = typename ATensor::element_type;
+  using TB = typename BTensor::element_type;
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  auto wg_m = get<0>(blk_coord);
+  auto wg_n = get<1>(blk_coord);
+  int local_id = item.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(A.shape());
+  Tensor cB = make_identity_tensor(B.shape());
+  Tensor cC = make_identity_tensor(C.shape());
+
+  auto wg_tile = mma.tile_mnk();
+  auto wg_coord = make_coord(wg_m, wg_n, 0);
+
+  Tensor gA = local_tile(
+      cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(
+      cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
+  Tensor gC =
+      local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{});  // (BLK_M,BLK_N)
+
+  auto copy_a = get_block_2d_copy_A<GmemTiledCopyA>(mma, A);
+  auto copy_b = get_block_2d_copy_B<GmemTiledCopyB>(mma, B);
+  auto copy_c = get_block_2d_copy_D<GmemTiledCopyC>(mma, C);
+
+  auto thr_mma = mma.get_slice(local_id);
+  auto thr_copy_a = copy_a.get_slice(local_id);
+  auto thr_copy_b = copy_b.get_slice(local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  /* Partition C */
+  auto thr_copy_c = copy_c.get_slice(local_id);
+  Tensor tCgC = thr_copy_c.partition_D(gC);
+  SubgroupTensor tCrC = thr_mma.partition_sg_fragment_C(gC);
+  auto tCrC_out = thr_copy_c.partition_sg_fragment_S(gC);
+  // Partial accumulator for current k_block
+  float tCrC_partial[tCrC.size()];
+
+  auto prefetch_a = make_block_2d_prefetch(copy_a);
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+  auto thr_prefetch_A = prefetch_a.get_slice(local_id);
+  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
+
+  auto pAgA = thr_prefetch_A.partition_S(gA);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  const int prefetch_dist = 3;
+
+  constexpr int barrier_scope = 2;
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+
+  // block_k = 128, tile_k from policy (typically 32)
+  static constexpr auto tile_k = get<2>(wg_tile);
+  constexpr int k_tiles_per_block = 128 / tile_k;
+
+  static constexpr auto ATOM_M =
+      get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+  static constexpr auto ATOM_N =
+      get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+
+  static constexpr auto tile_m = get<0>(wg_tile);
+  static constexpr auto tile_n = get<1>(wg_tile);
+
+  static constexpr auto SG_M = tile_m / ATOM_M;
+  static constexpr auto SG_N = tile_n / ATOM_N;
+
+  auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
+  int sg_local_id = cutlass::get_sub_group_local_id();
+  static constexpr int sg_local_range = 16;
+
+  int n_tile_start = wg_n * tile_n;
+  int n_sg_start = sg_local_n_coord * SG_N;
+
+  clear(tCrC);
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < tCrC.size(); ++i) {
+    tCrC_partial[i] = 0.0f;
+  }
+
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+  }
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    barrier_arrive(barrier_scope);
+
+    copy(copy_a, tAgA(_, _, _, k_tile), tArA);
+    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+
+    if (k_tile_prefetch < k_tile_count) {
+      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    }
+
+    reorder(tArA, tCrA);
+    reorder(tBrB, tCrB);
+
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+
+    // At the end of each 128-K block, apply per-block scale
+    if ((k_tile + 1) % k_tiles_per_block == 0) {
+      int k_block = k_tile / k_tiles_per_block;
+
+      // Apply scale per N element and accumulate into partial
+      CUTLASS_PRAGMA_UNROLL
+      for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
+        int sg_local_n = sn * sg_local_range + sg_local_id;
+        int n_abs = n_tile_start + n_sg_start + sg_local_n;
+        int n_block = n_abs / 128;
+        float scale = Scales[n_block * num_k_blocks + k_block];
+        CUTLASS_PRAGMA_UNROLL
+        for (int sm = 0; sm < SG_M; ++sm) {
+          int idx = sn * SG_M + sm;
+          tCrC_partial[idx] += tCrC(idx) * scale;
+        }
+      }
+      clear(tCrC);
+    }
+
+    barrier_wait(barrier_scope);
+  }
+
+  // Handle remainder: if K is not a multiple of 128
+  if (k_tile_count % k_tiles_per_block != 0) {
+    int k_block = k_tile_count / k_tiles_per_block;
+    CUTLASS_PRAGMA_UNROLL
+    for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
+      int sg_local_n = sn * sg_local_range + sg_local_id;
+      int n_abs = n_tile_start + n_sg_start + sg_local_n;
+      int n_block = n_abs / 128;
+      float scale = Scales[n_block * num_k_blocks + k_block];
+      CUTLASS_PRAGMA_UNROLL
+      for (int sm = 0; sm < SG_M; ++sm) {
+        int idx = sn * SG_M + sm;
+        tCrC_partial[idx] += tCrC(idx) * scale;
+      }
+    }
+  }
+
+  // Move final result back to tCrC for output
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < tCrC.size(); ++i) {
+    tCrC(i) = tCrC_partial[i];
+  }
+
+  if (Bias != nullptr) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
+      int sg_local_n = sn * sg_local_range + sg_local_id;
+      float b_float = Bias[n_tile_start + n_sg_start + sg_local_n];
+      CUTLASS_PRAGMA_UNROLL
+      for (int sm = 0; sm < SG_M; ++sm) {
+        tCrC(sn * SG_M + sm) += b_float;
+      }
+    }
+  }
+
+  reorder(tCrC, tCrC_out);
+  copy(copy_c, tCrC_out, tCgC);
+}
+
 template <
     class GmemTiledCopyA,
     class GmemTiledCopyB,

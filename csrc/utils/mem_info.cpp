@@ -23,6 +23,7 @@ size_t getTotalMemory(ze_device_handle_t& device) {
 }
 
 size_t getUsableMemory(ze_device_handle_t& device) {
+#ifdef ZE_DEVICE_USABLEMEM_SIZE_EXT_NAME
   ze_device_properties_t deviceProperties{};
   ze_device_usablemem_size_ext_properties_t usableMemProps{};
 
@@ -32,6 +33,13 @@ size_t getUsableMemory(ze_device_handle_t& device) {
 
   zeDeviceGetProperties(device, &deviceProperties);
   return usableMemProps.currUsableMemSize;
+#else
+  // Fallback for older Level Zero SDKs lacking the usable-mem-size extension
+  // (e.g. this vllm-0.17.1 container). Approximate usable memory with total
+  // device memory. NOTE: reports free==total; use a conservative
+  // gpu_memory_utilization in vllm to avoid OOM.
+  return getTotalMemory(device);
+#endif
 }
 
 std::tuple<int64_t, int64_t> getMemoryInfo(int64_t device_index) {

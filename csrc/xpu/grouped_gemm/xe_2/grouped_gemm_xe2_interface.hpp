@@ -88,7 +88,9 @@ void MoEGEMMLauncher(
     const int* rows_per_expert,
     const int num_experts,
     const int group_size,
-    int32_t* atomic_buffer) {
+    int32_t* atomic_buffer,
+    bool is_batched_layout = false,
+    int max_tokens_for_batched = 0) {
   using ElementA_non_CV = cutlass::platform::remove_cv_t<ElementA>;
   auto op = XE_DPAS_TT<8, float, ElementA_non_CV>{};
 
@@ -154,7 +156,9 @@ void MoEGEMMLauncher(
               gemm_n,
               gemm_k,
               atomic_buffer,
-              local_mem);
+              local_mem,
+              is_batched_layout,
+              max_tokens_for_batched);
         });
   });
 }
@@ -170,7 +174,9 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4) {
+    bool is_B_mxfp4,
+    bool is_batched_layout = false,
+    int64_t max_tokens_for_batched = 0) {
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
   auto A_dtype = ptr_A.dtype();
@@ -241,7 +247,9 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
       reinterpret_cast<int*>(rows_per_expert.data_ptr()),                      \
       num_experts,                                                             \
       group_size,                                                              \
-      static_cast<int*>(atomic_buffer.data_ptr()));
+      static_cast<int*>(atomic_buffer.data_ptr()),                             \
+      is_batched_layout,                                                       \
+      max_tokens_for_batched);
 
   if (is_B_int4 || is_B_mxfp4) {
     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
@@ -301,12 +309,37 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
   } else if (is_weight_fp8) {
     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
     TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
-    TORCH_CHECK(
-        ptr_scales->dim() == 1, "ptr_scales of fp8 must be 1D [num_experts]");
-    TORCH_CHECK(
-        ptr_scales->size(0) == num_experts,
-        "ptr_scales.size(0) of fp8 must match num_experts");
     TORCH_CHECK(ptr_scales->dtype() == at::kFloat, "ptr_scales must be float");
+
+    if (ptr_scales->dim() == 3) {
+      // Block FP8: scales are [num_experts, N/block_size, K/block_size]
+      TORCH_CHECK(
+          ptr_scales->size(0) == num_experts,
+          "ptr_scales.size(0) of block fp8 must match num_experts");
+      int scale_n_blocks = ptr_scales->size(1);
+      int scale_k_blocks = ptr_scales->size(2);
+      TORCH_CHECK(
+          N % scale_n_blocks == 0,
+          "N must be divisible by number of N blocks in scales");
+      TORCH_CHECK(
+          K % scale_k_blocks == 0,
+          "K must be divisible by number of K blocks in scales");
+      int block_n = N / scale_n_blocks;
+      int block_k = K / scale_k_blocks;
+      TORCH_CHECK(
+          block_n == block_k && block_n == 128,
+          "Block FP8 only supports block_size=128, got block_n=",
+          block_n, " block_k=", block_k);
+      group_size = 128;
+    } else {
+      // Per-tensor FP8: scales are [num_experts]
+      TORCH_CHECK(
+          ptr_scales->dim() == 1,
+          "ptr_scales of fp8 must be 1D [num_experts] or 3D [num_experts, N/128, K/128]");
+      TORCH_CHECK(
+          ptr_scales->size(0) == num_experts,
+          "ptr_scales.size(0) of fp8 must match num_experts");
+    }
 
 #define W8A16LauncherCallER(policy)                                         \
   if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {              \

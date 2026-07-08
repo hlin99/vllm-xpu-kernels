@@ -84,13 +84,22 @@ CUTE_DEVICE void MoEGEMM(
     const int32_t gemm_n,
     const int32_t gemm_k,
     int32_t* atomic_buffer,
-    const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
+    const sycl::local_accessor<int32_t, 1>& slm_mem_const,
+    bool is_batched_layout = false,
+    int max_tokens_for_batched = 0) {
   constexpr char actual_layout_of_B = LayoutKindB ^ ('R' ^ 'C');
   static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) &&
                                     (!std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) &&
                                      (std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
+  static constexpr bool is_B_fp8_type =
+      std::is_same_v<ElementB, cutlass::float_e5m2_t> ||
+      std::is_same_v<ElementB, cutlass::float_e4m3_t>;
+  // block FP8: group_size > 0 and B is FP8 type
+  bool is_block_fp8 = is_B_fp8_type && (group_size > 0);
+  int num_k_blocks = is_block_fp8 ? (gemm_k / group_size) : 0;
+  int num_n_blocks = is_block_fp8 ? (gemm_n / group_size) : 0;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_tile = mma.tile_mnk();
@@ -139,13 +148,17 @@ CUTE_DEVICE void MoEGEMM(
       B_offset /= 2;
     }
     ElementA* ptr_A_curr_batch =
-        const_cast<ElementA*>(Activations) + pre_rows * gemm_k;
+        const_cast<ElementA*>(Activations) + (is_batched_layout ? (expert_id * max_tokens_for_batched) : pre_rows) * gemm_k;
     ElementB* ptr_B_curr_batch = const_cast<ElementB*>(Weights) + B_offset;
-    ElementD* ptr_D_curr_batch = Outputs + pre_rows * gemm_n;
+    ElementD* ptr_D_curr_batch = Outputs + (is_batched_layout ? (expert_id * max_tokens_for_batched) : pre_rows) * gemm_n;
     ElementS* ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + expert_id;
     if constexpr (is_B_4bits) {
       ptr_Scales_curr_batch =
           const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
+    }
+    if (is_block_fp8) {
+      ptr_Scales_curr_batch =
+          const_cast<ElementS*>(Scales) + expert_id * num_n_blocks * num_k_blocks;
     }
     ElementBI* ptr_Bias_curr_batch = nullptr;
     if (Bias != static_cast<ElementBI*>(nullptr)) {
@@ -194,6 +207,16 @@ CUTE_DEVICE void MoEGEMM(
           XE_GEMM_4BITS_CALLER(256)
         }
 #undef XE_GEMM_4BITS_CALLER
+      } else if (is_block_fp8) {
+        xe_gemm_block_fp8<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
+            A_tensor,
+            B_tensor,
+            ptr_Scales_curr_batch,
+            ptr_Bias_curr_batch,
+            D_tensor,
+            tile_coord,
+            mma,
+            num_k_blocks);
       } else {
         xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
             A_tensor,

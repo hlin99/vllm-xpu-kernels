@@ -405,13 +405,15 @@ def xpu_fused_moe(hidden_states,
     w13: [num_experts, 2*inter_size, hidden_size]
     w13_scales:
         None for bf16/fp16
-        or [num_experts] for fp8
+        or [num_experts] for fp8 (per-tensor)
+        or [num_experts, 2*inter_size // 128, hidden_size // 128] for block fp8
         or [num_experts, 2*inter_size, hidden_size // group_size] for 4bits
     w13_bias: [num_experts, 2*inter_size] or None
     w2: [num_experts, hidden_size, inter_size]
     w2_scales:
         None for bf16/fp16
-        or [num_experts] for fp8
+        or [num_experts] for fp8 (per-tensor)
+        or [num_experts, hidden_size // 128, inter_size // 128] for block fp8
         or [num_experts, hidden_size, inter_size // group_size] for 4bits
     w2_bias: [num_experts, hidden_size] or None
     topk_weights: [num_rows, topk]
@@ -451,12 +453,31 @@ def xpu_fused_moe(hidden_states,
         output.copy_(out)
         return output
 
+    inter_size = list(w13.shape)[-2] // 2
+
     # 4bits support [E, N, K]
     # other types [E, K, N]
     if not is_int4 and not is_mxfp4:
-        inter_size = list(w13.shape)[-1] // 2
-    else:
-        inter_size = list(w13.shape)[-2] // 2
+        if not hasattr(w13, 'xpu_fused_moe'):
+            # Avoid 2x weight-memory peak: route the transpose+contiguous
+            # via host CPU so the original device buffer is freed before
+            # the new contiguous one is allocated.
+            import gc
+            for _w in (w13, w2):
+                _d = _w.device
+                _cpu = _w.detach().to('cpu')
+                _w.data = torch.empty(0, dtype=_w.dtype, device=_d)
+                gc.collect()
+                if _d.type == 'xpu':
+                    torch.xpu.empty_cache()
+                _new = _cpu.transpose(-1, -2).contiguous().to(_d)
+                del _cpu
+                _w.data = _new
+                del _new
+            w13.xpu_fused_moe = True
+            w13.inter_size = inter_size
+        else:
+            inter_size = w13.inter_size
 
     assert w13.is_contiguous() and w2.is_contiguous()
 
@@ -576,5 +597,137 @@ def xpu_fused_moe(hidden_states,
     torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                 unpermuted_row_to_permuted_row,
                                 num_experts)
+
+    return output
+
+def xpu_batched_fused_moe(hidden_states,
+                          w13,
+                          w13_scales,
+                          w13_bias,
+                          w2,
+                          w2_scales,
+                          w2_bias,
+                          expert_num_tokens,
+                          activation,
+                          num_experts,
+                          output,
+                          is_fp8=False,
+                          is_int4=False,
+                          is_mxfp4=False):
+    '''
+    Batched Layout Version of Fused MoE.
+    hidden_states: [num_experts, total_rank_num * max_tokens_per_rank, K]
+    w13: [num_experts, 2*inter_size, hidden_size]
+    w13_scales:
+        None for bf16/fp16
+        or [num_experts] for fp8 (per-tensor)
+        or [num_experts, 2*inter_size // 128, hidden_size // 128] for block fp8
+        or [num_experts, 2*inter_size, hidden_size // group_size] for 4bits
+    w2: [num_experts, hidden_size, inter_size]
+    w2_scales:
+        None for bf16/fp16
+        or [num_experts] for fp8 (per-tensor)
+        or [num_experts, hidden_size // 128, inter_size // 128] for block fp8
+        or [num_experts, hidden_size, inter_size // group_size] for 4bits
+    '''
+    E, max_tokens, hidden_size = hidden_states.shape
+    inter_size = list(w13.shape)[-2] // 2
+
+    assert w13.is_contiguous() and w2.is_contiguous()
+
+    if not is_int4 and not is_mxfp4:
+        if not hasattr(w13, 'xpu_fused_moe'):
+            # Avoid 2x weight-memory peak: route the transpose+contiguous
+            # via host CPU so the original device buffer is freed before
+            # the new contiguous one is allocated.
+            import gc
+            for _w in (w13, w2):
+                _d = _w.device
+                _cpu = _w.detach().to('cpu')
+                _w.data = torch.empty(0, dtype=_w.dtype, device=_d)
+                gc.collect()
+                if _d.type == 'xpu':
+                    torch.xpu.empty_cache()
+                _new = _cpu.transpose(-1, -2).contiguous().to(_d)
+                del _cpu
+                _w.data = _new
+                del _new
+            w13.xpu_fused_moe = True
+            w13.inter_size = inter_size
+        else:
+            inter_size = w13.inter_size
+            
+    if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
+        w13_tmp = torch.empty_like(w13)
+        w2_tmp = torch.empty_like(w2)
+        for i in range(num_experts):
+            w13_tmp[i] = implement_zp(w13[i])
+            w2_tmp[i] = implement_zp(w2[i])
+        w13_tmp = w13_tmp.contiguous()
+        w2_tmp = w2_tmp.contiguous()
+        w13.data = w13_tmp
+        w2.data = w2_tmp
+        w13.xpu_fused_moe = True
+        
+    gemm1_output = torch.empty((E, max_tokens, 2 * inter_size),
+                               dtype=hidden_states.dtype,
+                               device=hidden_states.device)
+
+    if not is_fp8 and not is_int4 and not is_mxfp4:
+        gemm1_scales = None
+        gemm2_scales = None
+    else:
+        gemm1_scales = w13_scales
+        gemm2_scales = w2_scales
+
+    # ptr_A and ptr_D must be 2D to satisfy C++ shape assertions, although they 
+    # are physically laid out as [E, max_tokens, K]
+    hidden_states_flat = hidden_states.view(-1, hidden_size)
+    gemm1_output_flat = gemm1_output.view(-1, 2 * inter_size)
+
+    torch.ops._xpu_C.cutlass_batched_gemm_interface(
+        ptr_A=hidden_states_flat,
+        ptr_B=w13,
+        ptr_scales=gemm1_scales,
+        ptr_bias=w13_bias,
+        ptr_D=gemm1_output_flat,
+        expert_num_tokens=expert_num_tokens,
+        max_tokens_per_rank=max_tokens,
+        N=2 * inter_size,
+        K=hidden_size,
+        num_experts=num_experts,
+        is_B_int4=is_int4,
+        is_B_mxfp4=is_mxfp4)
+
+    act_output = torch.empty((E, max_tokens, inter_size),
+                             dtype=gemm1_output.dtype,
+                             device=gemm1_output.device)
+
+    act_output_flat = act_output.view(-1, inter_size)
+
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(act_output_flat, gemm1_output_flat)
+    elif activation == "gelu":
+        torch.ops._C.gelu_and_mul(act_output_flat, gemm1_output_flat)
+    elif activation == "swigluoai":
+        torch.ops._C.swigluoai_and_mul(act_output_flat, gemm1_output_flat, 1.702, 7.0)
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
+
+    output_flat = output.view(-1, hidden_size)
+
+    torch.ops._xpu_C.cutlass_batched_gemm_interface(
+        ptr_A=act_output_flat,
+        ptr_B=w2,
+        ptr_scales=gemm2_scales,
+        ptr_bias=w2_bias,
+        ptr_D=output_flat,
+        expert_num_tokens=expert_num_tokens,
+        max_tokens_per_rank=max_tokens,
+        N=hidden_size,
+        K=inter_size,
+        num_experts=num_experts,
+        is_B_int4=is_int4,
+        is_B_mxfp4=is_mxfp4)
 
     return output
