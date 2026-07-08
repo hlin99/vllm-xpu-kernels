@@ -405,13 +405,15 @@ def xpu_fused_moe(hidden_states,
     w13: [num_experts, 2*inter_size, hidden_size]
     w13_scales:
         None for bf16/fp16
-        or [num_experts] for fp8
+        or [num_experts] for fp8 (per-tensor)
+        or [num_experts, 2*inter_size // 128, hidden_size // 128] for block fp8
         or [num_experts, 2*inter_size, hidden_size // group_size] for 4bits
     w13_bias: [num_experts, 2*inter_size] or None
     w2: [num_experts, hidden_size, inter_size]
     w2_scales:
         None for bf16/fp16
-        or [num_experts] for fp8
+        or [num_experts] for fp8 (per-tensor)
+        or [num_experts, hidden_size // 128, inter_size // 128] for block fp8
         or [num_experts, hidden_size, inter_size // group_size] for 4bits
     w2_bias: [num_experts, hidden_size] or None
     topk_weights: [num_rows, topk]
