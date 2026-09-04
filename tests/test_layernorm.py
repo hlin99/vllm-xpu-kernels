@@ -127,6 +127,66 @@ def test_rms_norm_uncontigous(
     )
 
 
+@pytest.mark.parametrize(
+    "input_shape",
+    [
+        (2, 128),
+        (2, 3, 128),
+        (2, 4, 8, 128),
+        (2, 3, 5, 127),
+    ],
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@torch.inference_mode()
+def test_rms_norm_stacked_weight(
+    input_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    import vllm_xpu_kernels._C  # noqa: F401
+
+    torch.manual_seed(0)
+    torch.set_default_device("xpu")
+    torch.xpu.set_device(device)
+
+    x = torch.randn(input_shape, dtype=dtype)
+    weight = torch.randn(input_shape[0], input_shape[-1], dtype=dtype)
+    weight[1].zero_()
+    out = torch.empty_like(x)
+
+    torch.ops._C.rms_norm(out, x, weight, 1e-6)
+
+    broadcast_shape = (input_shape[0], ) + (1, ) * (len(input_shape) - 2) + (
+        input_shape[-1], )
+    ref = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) +
+                                  1e-6)
+    ref *= weight.float().view(broadcast_shape)
+    torch.testing.assert_close(out, ref.to(dtype), atol=1e-2, rtol=1e-2)
+    assert out[1].count_nonzero() == 0
+
+
+@pytest.mark.parametrize(
+    "weight_shape",
+    [
+        (128, 1),
+        (3, 128),
+        (2, 4, 128),
+    ],
+)
+@torch.inference_mode()
+def test_rms_norm_rejects_invalid_weight_shape(
+    weight_shape: tuple[int, ...], ) -> None:
+    import vllm_xpu_kernels._C  # noqa: F401
+
+    x = torch.randn(2, 4, 8, 128, dtype=torch.half, device="xpu")
+    weight = torch.randn(weight_shape, dtype=torch.half, device="xpu")
+    out = torch.empty_like(x)
+
+    with pytest.raises(RuntimeError):
+        torch.ops._C.rms_norm(out, x, weight, 1e-6)
+
+
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
