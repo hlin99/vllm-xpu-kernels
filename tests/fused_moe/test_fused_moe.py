@@ -10,6 +10,53 @@ from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
 
 DEVICE = "xpu"
 
+
+@pytest.mark.parametrize("rows", [1, 17])
+@pytest.mark.parametrize(
+    "weight_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn, torch.float4_e2m1fn_x2])
+def test_prepermuted_experts_match_routed_experts(rows, weight_dtype):
+    """External dispatch must bypass remap without changing expert results."""
+    seed_everything(7)
+    hidden, intermediate, experts, topk = 128, 128, 4, 2
+    x = torch.randn(rows, hidden, device=DEVICE, dtype=torch.bfloat16) / 8
+    if weight_dtype == torch.float4_e2m1fn_x2:
+        w13 = torch.randint(
+            0, 256, (experts, 2 * intermediate, hidden // 2),
+            device=DEVICE, dtype=torch.uint8).view(weight_dtype)
+        w2 = torch.randint(
+            0, 256, (experts, hidden, intermediate // 2),
+            device=DEVICE, dtype=torch.uint8).view(weight_dtype)
+        scale13 = torch.full((experts, 2 * intermediate, hidden // 32),
+                             123, device=DEVICE, dtype=torch.uint8)
+        scale2 = torch.full((experts, hidden, intermediate // 32),
+                            123, device=DEVICE, dtype=torch.uint8)
+    else:
+        w13 = (torch.randn(experts, hidden, 2 * intermediate, device=DEVICE)
+               / 16).to(weight_dtype)
+        w2 = (torch.randn(experts, intermediate, hidden, device=DEVICE)
+              / 16).to(weight_dtype)
+        scale13 = scale2 = (torch.ones(experts, device=DEVICE)
+                           if weight_dtype == torch.float8_e4m3fn else None)
+    moe = XpuFusedMoe(w13, scale13, None, w2, scale2, None, topk, "silu",
+                      experts, gemm1_clamp_limit=0.1)
+    ids = torch.arange(rows * topk, device=DEVICE).reshape(rows, topk) % 3
+    weights = torch.randn(rows, topk, device=DEVICE).softmax(-1)
+    expected = torch.empty_like(x)
+    moe.apply(expected, x, weights, ids)
+
+    order = ids.flatten().argsort()
+    packed = x[order // topk].contiguous()
+    counts = ids.flatten().bincount(minlength=experts).to(torch.int32)
+    expert_output = torch.empty_like(packed)
+    moe.apply_permuted(expert_output, packed, counts)
+    actual = torch.empty_like(x)
+    positions = order.argsort().reshape(rows, topk).to(torch.int32)
+    torch.ops._moe_C.moe_gather(actual, expert_output, weights, positions,
+                               experts)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # shape for Llama-4-scout
 FUSED_MOE_MNK_FACTORS = [
     (1, 5120, 8192),

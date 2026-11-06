@@ -404,6 +404,46 @@ class XpuFusedMoe:
             total_experts_num=self.total_experts_num,
             local_experts_num=self.local_experts_num)
 
+        gemm2_output = torch.empty((num_moe_inputs, hidden_size),
+                                  dtype=output.dtype,
+                                  device=output.device)
+        self.apply_permuted(gemm2_output, remapped_hidden_states,
+                            rows_per_expert, remapped_scales)
+        torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
+                                   unpermuted_row_to_permuted_row,
+                                   self.num_experts)
+
+    def apply_permuted(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        rows_per_expert: torch.Tensor,
+        a1q_scale: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Run expert GEMMs on packed expert rows, without routing or reduction.
+
+        Args:
+            output: Caller-owned expert output, before top-k weighting.
+            hidden_states: Expert-major rows packed without gaps.
+            rows_per_expert: Int32 row counts in local weight order.
+            a1q_scale: Optional activation scales in the same row order.
+        """
+        if self._use_ref:
+            raise ValueError("apply_permuted requires native grouped GEMMs")
+        if (hidden_states.ndim != 2 or output.ndim != 2
+                or hidden_states.shape[0] != output.shape[0]
+                or not hidden_states.is_contiguous()
+                or not output.is_contiguous()):
+            raise ValueError("Expected contiguous expert input/output rows")
+        if (rows_per_expert.shape != (self.num_experts,)
+                or rows_per_expert.dtype != torch.int32
+                or rows_per_expert.device != hidden_states.device):
+            raise ValueError("Expected one device int32 count per local expert")
+        num_moe_inputs, hidden_size = output.shape
+        remapped_hidden_states = hidden_states
+        remapped_scales = a1q_scale
+        act_quant = a1q_scale is not None
+
         # MXFP8 / block-FP8 activation scales: dequant to compute dtype so the
         # Xe2 grouped GEMM runs W8A16 / W16A16 (ptr_A_scale is accepted by the
         # op schema but Xe2 currently consumes high-precision A). This matches
@@ -458,9 +498,7 @@ class XpuFusedMoe:
             self.act_func(act_output, gemm1_output)
 
         ########### gemm2 ##################
-        gemm2_output = torch.empty((num_moe_inputs, hidden_size),
-                                dtype=output.dtype,
-                                device=output.device)
+        gemm2_output = output
 
         if act_quant:
             act_output, gemm2_act_scale = quant_act_xpu(act_output, self.recipe)
@@ -486,7 +524,3 @@ class XpuFusedMoe:
             N=hidden_size,
             K=self.inter_size * self.inter_size_scale,
             num_experts=self.num_experts)
-
-        torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
-                                    unpermuted_row_to_permuted_row,
-                                    self.num_experts)
